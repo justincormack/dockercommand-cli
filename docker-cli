@@ -1,0 +1,114 @@
+#!/bin/sh
+
+set -e
+
+INSTALLDIR=~/bin
+DOCKER=/usr/local/bin/docker
+
+usage () {
+  printf "usage: ${NAME} help|create|rm|ls\n"
+  exit 0
+}
+
+create() {
+  # at present only support exec method
+  TYPE="exec"
+
+  if [ $# -lt 3 ]
+  then
+    printf "usage: ${NAME} create commands [options] container\n"
+    exit 1
+  fi
+
+  shift
+
+  # mount home directory
+  # XXX should also set HOME in container? eg how will ssh keys be found?
+  TAGS="${TAGS} -v ${HOME}:${HOME}"
+
+  COMMANDS="$(echo $1 | sed 's/,/ /g')"
+  shift
+
+  for c in ${COMMANDS}
+  do
+    TAGS="${TAGS} --label=com.docker.cli.${c}=${TYPE}"
+  done
+  [ ! -f ${INSTALLDIR}/${NAME} ] && \
+    printf "docker-cli not installed in ${INSTALLDIR}\n" && exit 1
+  for c in ${COMMANDS}
+  do
+    [ -L ${INSTALLDIR}/${c} ] && rm -f ${INSTALLDIR}/${c}
+    [ -f ${INSTALLDIR}/${c} ] && \
+      printf "command ${c} already exists in ${INSTALLDIR}\n" && exit 1
+    ln -s ${INSTALLDIR}/${NAME} ${INSTALLDIR}/${c} || \
+      (printf "symlink failed\n" && exit 1)
+    CONTAINER="$(${DOCKER} ps -q --filter=label=com.docker.cli.${c}=${TYPE})"
+    if [ -n "${CONTAINER}" ]
+    then
+      printf "command ${c} already being provided by a container\n"
+      exit 1
+    fi
+  done
+
+  ${DOCKER} run -d -t ${TAGS} --restart=unless-stopped $* tail -f /dev/null || \
+    (printf "docker run failed\n" && exit 1)
+  hash -d ${c} 2>/dev/null || true
+  exit 0
+}
+
+delete() {
+  TYPE="exec"
+  [ $# -lt 2 ] && printf "usage: ${NAME} rm commands\n" && exit 1
+
+  for cs in $*
+  do
+    COMMANDS="$(echo ${cs} | sed 's/,/ /g')"
+
+    for c in ${COMMANDS}
+    do
+      [ -L ${INSTALLDIR}/${c} ] && rm -f ${INSTALLDIR}/${c}
+      hash -d ${c} 2>/dev/null || true
+      CONTAINER="$(${DOCKER} ps -q --filter=label=com.docker.cli.${c}=${TYPE})"
+      [ -n "${CONTAINER}" ] && \
+        (${DOCKER} stop ${CONTAINER} > /dev/null && ${DOCKER} rm ${CONTAINER})
+    done
+  done
+  exit 0
+}
+
+list() {
+  TYPE="exec"
+  cd ${INSTALLDIR}
+  for f in *
+  do
+    if [ -L ${f} -a "$(readlink ${f})" = "${INSTALLDIR}/${NAME}" ]
+    then
+      CONTAINER="$(${DOCKER} ps -q --filter=label=com.docker.cli.${f}=${TYPE})"
+      [ -z "${CONTAINER}" ] && CONTAINER="(none)"
+      printf "${f}\t${CONTAINER}\n"
+    fi
+  done
+  exit 0
+}
+
+NAME="$(basename $0)"
+
+if [ ${NAME} = "docker-cli" ]
+then
+  [ $# -eq 0 ] && usage
+  [ $1 = "help" ] && usage
+  [ $1 = "create" ] && create $*
+  [ $1 = "rm" -o $1 = "delete" ] && delete $*
+  [ $1 = "ls" ] && list $*
+  usage
+fi
+
+TYPE=exec
+# test for multiple results better
+CONTAINER="$(${DOCKER} ps -q --filter=label=com.docker.cli.${NAME}=${TYPE} | head -1)"
+[ -z "${CONTAINER}" ] && \
+  printf "no matching container found for ${NAME}\n" && exit 1
+
+[ -t 1 ] && TTY="-t"
+
+exec ${DOCKER} exec -i ${TTY} ${CONTAINER} sh -c "cd ${PWD} && ${NAME} $*"
